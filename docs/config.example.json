@@ -1,0 +1,33 @@
+{
+  "config_version": 1,
+  "default_flags": {
+    "widgets.insights": false,
+    "widgets.include_metadata": false
+  },
+  "default_max_body_bytes": 65536,
+  "default_rate_limit": { "limit": 200, "window_ms": 60000 },
+  "tenants": {
+    "tenant-a": {
+      "scopes": ["widgets:read", "widgets:write"],
+      "credentials": [
+        {
+          "comment": "token_hash 填写 SHA-256(完整 Bearer 令牌) 的十六进制摘要；用 app.credentials.mint_token 生成，切勿填写明文",
+          "token_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "label": "ci-writer",
+          "scopes": ["widgets:read", "widgets:write"],
+          "expires_at": null
+        }
+      ],
+      "rate_limits": {
+        "default": { "limit": 1000, "window_ms": 60000 },
+        "POST /api/v1/widgets": { "limit": 100, "window_ms": 1000 },
+        "POST /api/v2/widgets": { "limit": 100, "window_ms": 1000 }
+      },
+      "flags": {
+        "widgets.insights": true,
+        "widgets.include_metadata": false
+      },
+      "max_body_bytes": 65536
+    }
+  }
+}
