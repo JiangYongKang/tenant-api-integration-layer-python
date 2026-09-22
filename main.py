@@ -1,8 +1,8 @@
-from fastapi import FastAPI
+from integration_layer.app import create_app
 
-app = FastAPI()
+app = create_app()
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"service": "tenant-api-integration-layer", "versions": ["v1", "v2"]}
