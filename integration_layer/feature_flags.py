@@ -58,21 +58,35 @@ class FlagSnapshot:
 
 
 class FlagStore:
-    """线程安全的开关存储；replace 原子生效。"""
+    """线程安全的开关存储；replace 原子生效。
+
+    独立模式：持有自己的 FlagSnapshot；
+    绑定 ConfigManager 后：快照来自当前生效配置，replace 走版本化提交。
+    """
 
     def __init__(self, flags: dict[str, FlagRule] | None = None) -> None:
         self._lock = threading.Lock()
+        self._manager = None
         try:
             self._snapshot = FlagSnapshot(flags=dict(flags or {}))
         except ApiError:
             self._snapshot = FlagSnapshot(flags={})  # 回退安全默认
 
+    def bind(self, manager) -> None:
+        self._manager = manager
+
     def snapshot(self) -> FlagSnapshot:
+        if self._manager is not None:
+            # 请求开始时取一次：在途请求持有同一不可变快照，切换不会半生效
+            return self._manager.current().flag_snapshot()
         with self._lock:
             return self._snapshot
 
     def replace(self, flags: dict[str, FlagRule]) -> None:
         """原子替换；非法配置抛 INVALID_CONFIG 且保留旧配置。"""
+        if self._manager is not None:
+            self._manager.replace_flags(flags)
+            return
         new_snapshot = FlagSnapshot(flags=dict(flags))  # 校验失败则抛错，旧配置不动
         with self._lock:
             self._snapshot = new_snapshot

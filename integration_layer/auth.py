@@ -45,11 +45,21 @@ class AuthContext:
 
 
 class CredentialStore:
-    """线程安全的本地凭证库。"""
+    """线程安全的本地凭证库。
+
+    两种工作模式：
+    - 独立模式（默认）：register/revoke 直接改本地字典，行为与最初版本一致；
+    - 绑定 ConfigManager 后：写操作走配置版本化提交，authenticate 始终基于
+      当前生效快照，运维入口和测试/装配入口看到的是同一份凭证状态。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._by_key_id: dict[str, TenantCredential] = {}
+        self._manager = None
+
+    def bind(self, manager) -> None:
+        self._manager = manager
 
     def register(
         self,
@@ -59,6 +69,10 @@ class CredentialStore:
         secret: str | None = None,
     ) -> tuple[str, str]:
         """注册租户凭证，返回 (key_id, secret)。secret 仅此处出现一次。"""
+        if self._manager is not None:
+            return self._manager.issue_credential(
+                tenant_id, set(scopes), expires_at=expires_at, secret=secret
+            )
         secret = secret or secrets.token_urlsafe(32)
         key_id = f"{tenant_id}.{secrets.token_hex(4)}"
         cred = TenantCredential(
@@ -73,18 +87,30 @@ class CredentialStore:
         return key_id, secret
 
     def revoke(self, key_id: str) -> None:
+        if self._manager is not None:
+            self._manager.revoke_credential(key_id)
+            return
         with self._lock:
             self._by_key_id.pop(key_id, None)
 
     def authenticate(
-        self, key_id: str | None, secret: str | None, now: float | None = None
+        self, key_id: str | None, secret: str | None, now: float | None = None,
+        snapshot=None,
     ) -> AuthContext:
-        """校验凭证，区分缺失 / 无效 / 过期三种失败。"""
+        """校验凭证，区分缺失 / 无效 / 过期三种失败。
+
+        传入 snapshot 时基于该不可变快照判定，保证在途请求不受配置切换/回退影响。
+        """
         now = time.time() if now is None else now
         if not key_id or not secret:
             raise ApiError(ErrorCode.CREDENTIAL_MISSING, "missing credential headers")
-        with self._lock:
-            cred = self._by_key_id.get(key_id)
+        if snapshot is not None:
+            cred = snapshot.credentials.get(key_id)
+        elif self._manager is not None:
+            cred = self._manager.current().credentials.get(key_id)
+        else:
+            with self._lock:
+                cred = self._by_key_id.get(key_id)
         if cred is None or not hmac.compare_digest(
             cred.secret_hash, hashlib.sha256(secret.encode("utf-8")).hexdigest()
         ):
