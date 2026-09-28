@@ -9,8 +9,12 @@ from __future__ import annotations
 import hashlib
 import threading
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .errors import ApiError, ErrorCode
+
+if TYPE_CHECKING:
+    from .config_manager import ConfigManager
 
 
 @dataclass(frozen=True)
@@ -62,17 +66,29 @@ class FlagStore:
 
     def __init__(self, flags: dict[str, FlagRule] | None = None) -> None:
         self._lock = threading.Lock()
+        self._snapshot: FlagSnapshot | None = None
+        self._manager: "ConfigManager | None" = None
         try:
             self._snapshot = FlagSnapshot(flags=dict(flags or {}))
         except ApiError:
             self._snapshot = FlagSnapshot(flags={})  # 回退安全默认
 
+    def bind(self, manager: "ConfigManager") -> None:
+        """绑定配置管理器：读取以管理器快照为准；replace 委托原子提交。"""
+        self._manager = manager
+
     def snapshot(self) -> FlagSnapshot:
+        if self._manager is not None:
+            return FlagSnapshot(flags=dict(self._manager.snapshot().flags))
         with self._lock:
+            assert self._snapshot is not None
             return self._snapshot
 
     def replace(self, flags: dict[str, FlagRule]) -> None:
         """原子替换；非法配置抛 INVALID_CONFIG 且保留旧配置。"""
+        if self._manager is not None:
+            self._manager.replace_flags(flags)
+            return
         new_snapshot = FlagSnapshot(flags=dict(flags))  # 校验失败则抛错，旧配置不动
         with self._lock:
             self._snapshot = new_snapshot

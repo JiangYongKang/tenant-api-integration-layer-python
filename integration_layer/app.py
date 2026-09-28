@@ -10,10 +10,18 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .admin import register_admin_routes
 from .auth import AuthContext, CredentialStore, require_scope
+from .config_manager import ConfigManager, ConfigSnapshot
 from .errors import ApiError, ErrorCode, HTTP_STATUS, error_body
 from .feature_flags import FlagRule, FlagSnapshot, FlagStore
-from .idempotency import IdempotencyStore, content_fingerprint
+from .idempotency import (
+    IdempotencyStore,
+    content_fingerprint,
+    OP_CREATE,
+    OP_UPDATE,
+    OP_DELETE,
+)
 from .rate_limit import RateLimiter, RateLimitRule
 from .resources import ResourceStore
 from .versioning import VersionRegistry, VersionSpec
@@ -21,6 +29,7 @@ from .versioning import VersionRegistry, VersionSpec
 logger = logging.getLogger("integration_layer")
 
 DEFAULT_MAX_BODY_BYTES = 64 * 1024
+DEFAULT_CONFIG_HISTORY_LIMIT = 10
 
 
 @dataclass
@@ -30,10 +39,11 @@ class LayerConfig:
         default_factory=lambda: RateLimitRule(capacity=20, refill_per_second=10.0)
     )
     flags: dict[str, FlagRule] = field(default_factory=dict)
+    config_history_limit: int = DEFAULT_CONFIG_HISTORY_LIMIT
 
 
 def build_version_registry() -> VersionRegistry:
-    """注册对外版本：v1 冻结，v2 新增可选字段 labels 与 extended_status 能力。"""
+    """注册对外版本：v1 冻结；v2 新增 labels、extended_status 与资源生命周期能力。"""
     reg = VersionRegistry()
     reg.register(
         VersionSpec(
@@ -46,9 +56,9 @@ def build_version_registry() -> VersionRegistry:
     reg.register(
         VersionSpec(
             version="v2",
-            known_fields=frozenset({"name", "labels"}),
+            known_fields=frozenset({"name", "labels", "expected_version"}),
             required_fields=frozenset({"name"}),
-            capabilities=frozenset({"extended_status"}),
+            capabilities=frozenset({"extended_status", "resource_lifecycle"}),
         )
     )
     return reg
@@ -66,6 +76,17 @@ def create_app(config: LayerConfig | None = None) -> FastAPI:
     app.state.resources = ResourceStore()
     app.state.versions = build_version_registry()
     app.state.config = config
+
+    # 配置版本管理：凭证/限流/灰度在同一快照内原子整体生效
+    initial_flags = app.state.flags.snapshot().flags if not config.flags else dict(config.flags)
+    app.state.config_manager = ConfigManager(
+        ConfigSnapshot(flags=dict(initial_flags)),
+        history_limit=config.config_history_limit,
+        default_rate_rule=config.default_rate_rule,
+    )
+    app.state.credentials.bind(app.state.config_manager)
+    app.state.rate_limiter.bind(app.state.config_manager)
+    app.state.flags.bind(app.state.config_manager)
 
     @app.middleware("http")
     async def request_context_middleware(request: Request, call_next):
@@ -123,11 +144,17 @@ def create_app(config: LayerConfig | None = None) -> FastAPI:
         err = ApiError(ErrorCode.INTERNAL_ERROR, "internal error")
         return _error_response(err, request_id)
 
-    def _authenticate(request: Request) -> AuthContext:
+    def _authenticate(request: Request, snap: ConfigSnapshot) -> AuthContext:
         return request.app.state.credentials.authenticate(
             request.headers.get("x-api-key-id"),
             request.headers.get("x-api-secret"),
+            credentials=snap.credentials,
         )
+
+    def _request_config(request: Request) -> tuple[ConfigSnapshot, FlagSnapshot]:
+        """请求开始取一次整体配置快照，整个请求内一致，不受并发运维变更影响。"""
+        snap = request.app.state.config_manager.snapshot()
+        return snap, FlagSnapshot(flags=dict(snap.flags))
 
     def _parse_body(request: Request) -> dict[str, Any]:
         raw = getattr(request.state, "raw_body", b"")
@@ -144,10 +171,12 @@ def create_app(config: LayerConfig | None = None) -> FastAPI:
     @app.post("/api/resources", status_code=201)
     async def create_resource(request: Request) -> JSONResponse:
         spec = request.app.state.versions.get(request.headers.get("x-api-version"))
-        ctx = _authenticate(request)
+        snap, flags = _request_config(request)
+        ctx = _authenticate(request, snap)
         require_scope(ctx, "resources:write")
-        request.app.state.rate_limiter.check(ctx.tenant_id, "POST /api/resources")
-        flags: FlagSnapshot = request.app.state.flags.snapshot()  # 请求内一致
+        request.app.state.rate_limiter.check(
+            ctx.tenant_id, "POST /api/resources", rules=snap.rate_rules
+        )
 
         payload = _parse_body(request)
         if "labels" in payload and "labels" not in spec.known_fields:
@@ -172,15 +201,25 @@ def create_app(config: LayerConfig | None = None) -> FastAPI:
 
         fingerprint = content_fingerprint(payload)
 
-        def side_effect() -> dict[str, Any]:
-            res = request.app.state.resources.create(ctx.tenant_id, payload["name"])
-            out = res.as_dict()
+        def side_effect() -> tuple[int, dict[str, Any]]:
+            res = request.app.state.resources.create(
+                ctx.tenant_id,
+                payload["name"],
+                labels=payload.get("labels"),
+            )
+            # 创建响应只含创建语义字段；生命周期字段（version/updated_at/deleted）
+            # 属于后续版本的读取/更新/删除投影，不在创建响应出现
+            out: dict[str, Any] = {
+                "id": res.id,
+                "status": res.status,
+                "created_at": res.created_at,
+            }
             if "labels" in spec.known_fields:
-                out["labels"] = payload.get("labels", {})
-            return out
+                out["labels"] = res.labels
+            return 201, out
 
-        result, replayed = request.app.state.idempotency.execute(
-            ctx.tenant_id, idem_key, fingerprint, side_effect
+        (first_status, result), replayed = request.app.state.idempotency.execute(
+            ctx.tenant_id, idem_key, fingerprint, side_effect, op=OP_CREATE
         )
 
         if extended:
@@ -194,7 +233,7 @@ def create_app(config: LayerConfig | None = None) -> FastAPI:
         body = VersionRegistry.project_response(spec, result)
         body["request_id"] = request.state.request_id
         return JSONResponse(
-            status_code=200 if replayed else 201,
+            status_code=200 if replayed else first_status,
             content=body,
             headers={"x-request-id": request.state.request_id},
         )
@@ -202,16 +241,179 @@ def create_app(config: LayerConfig | None = None) -> FastAPI:
     @app.get("/api/resources/{resource_id}")
     async def get_resource(resource_id: str, request: Request) -> JSONResponse:
         spec = request.app.state.versions.get(request.headers.get("x-api-version"))
-        ctx = _authenticate(request)
+        snap, _flags = _request_config(request)
+        ctx = _authenticate(request, snap)
         require_scope(ctx, "resources:read")
-        request.app.state.rate_limiter.check(ctx.tenant_id, "GET /api/resources")
+        request.app.state.rate_limiter.check(
+            ctx.tenant_id, "GET /api/resources", rules=snap.rate_rules
+        )
 
         res = request.app.state.resources.get(ctx.tenant_id, resource_id)
         if res is None:
             raise ApiError(ErrorCode.NOT_FOUND, "resource not found")
         body = VersionRegistry.project_response(spec, res.as_dict())
+        if "labels" in spec.known_fields:
+            body["labels"] = res.labels
         body["request_id"] = request.state.request_id
         return JSONResponse(content=body, headers={"x-request-id": request.state.request_id})
+
+    def _require_idem_key(request: Request) -> str:
+        idem_key = request.headers.get("idempotency-key")
+        if not idem_key:
+            raise ApiError(
+                ErrorCode.VALIDATION_FAILED, "Idempotency-Key header is required"
+            )
+        return idem_key
+
+    def _parse_if_match(request: Request) -> int | None:
+        """解析 If-Match（资源 version）；头缺失表示不带版本前提；非法明确拒绝。"""
+        raw = request.headers.get("if-match")
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ApiError(
+                ErrorCode.VALIDATION_FAILED,
+                "If-Match must be an integer resource version",
+            )
+        if value < 1:
+            raise ApiError(
+                ErrorCode.VALIDATION_FAILED, "If-Match version must be >= 1"
+            )
+        return value
+
+    @app.patch("/api/resources/{resource_id}")
+    async def update_resource(resource_id: str, request: Request) -> JSONResponse:
+        spec = request.app.state.versions.get(request.headers.get("x-api-version"))
+        # 更新/删除属于资源生命周期能力：旧版本明确拒绝，不悄悄降级
+        VersionRegistry.require_capability(spec, "resource_lifecycle")
+        snap, _flags = _request_config(request)
+        ctx = _authenticate(request, snap)
+        require_scope(ctx, "resources:write")
+        request.app.state.rate_limiter.check(
+            ctx.tenant_id, "PATCH /api/resources", rules=snap.rate_rules
+        )
+
+        payload = _parse_body(request)
+        unknown = set(payload) - spec.known_fields
+        if unknown:
+            raise ApiError(
+                ErrorCode.VALIDATION_FAILED,
+                f"unknown fields for version {spec.version}: {sorted(unknown)}",
+                details={"unknown": sorted(unknown), "version": spec.version},
+            )
+        if "expected_version" not in payload:
+            raise ApiError(
+                ErrorCode.VALIDATION_FAILED,
+                "missing required field: expected_version",
+                details={"missing": ["expected_version"], "version": spec.version},
+            )
+        expected_version = payload["expected_version"]
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool):
+            raise ApiError(
+                ErrorCode.VALIDATION_FAILED,
+                "expected_version must be an integer",
+            )
+        changes: dict[str, Any] = {}
+        if "name" in payload:
+            if not isinstance(payload["name"], str) or not payload["name"]:
+                raise ApiError(
+                    ErrorCode.VALIDATION_FAILED, "name must be a non-empty string"
+                )
+            changes["name"] = payload["name"]
+        if "labels" in payload:
+            if not isinstance(payload["labels"], dict):
+                raise ApiError(
+                    ErrorCode.VALIDATION_FAILED, "labels must be an object"
+                )
+            changes["labels"] = payload["labels"]
+        if not changes:
+            raise ApiError(
+                ErrorCode.VALIDATION_FAILED,
+                "update payload must contain at least one mutable field",
+            )
+
+        idem_key = _require_idem_key(request)
+        # 指纹含期望版本：同键提交不同的更新前提也算不同请求
+        fingerprint = content_fingerprint({"resource_id": resource_id, **payload})
+
+        def side_effect() -> tuple[int, dict[str, Any]]:
+            res = request.app.state.resources.update(
+                ctx.tenant_id, resource_id, expected_version, changes
+            )
+            out = res.as_dict()
+            # updated_at 在首次提交时固定，保证同键重放响应逐字一致
+            out["updated_at"] = res.updated_at if res.updated_at is not None else out["created_at"]
+            return 200, out
+
+        (status_code, result), replayed = request.app.state.idempotency.execute(
+            ctx.tenant_id, idem_key, fingerprint, side_effect, op=OP_UPDATE
+        )
+
+        _log(
+            request.state.request_id,
+            "resource_updated" if not replayed else "resource_update_replayed",
+            f"tenant={ctx.tenant_id} cred={ctx.credential_fingerprint} key={idem_key}",
+        )
+        body = VersionRegistry.project_response(spec, result)
+        if "labels" in spec.known_fields:
+            body["labels"] = result.get("labels", {})
+        body["request_id"] = request.state.request_id
+        return JSONResponse(
+            status_code=status_code,
+            content=body,
+            headers={"x-request-id": request.state.request_id},
+        )
+
+    @app.delete("/api/resources/{resource_id}")
+    async def delete_resource(resource_id: str, request: Request) -> JSONResponse:
+        spec = request.app.state.versions.get(request.headers.get("x-api-version"))
+        VersionRegistry.require_capability(spec, "resource_lifecycle")
+        snap, _flags = _request_config(request)
+        ctx = _authenticate(request, snap)
+        require_scope(ctx, "resources:write")
+        request.app.state.rate_limiter.check(
+            ctx.tenant_id, "DELETE /api/resources", rules=snap.rate_rules
+        )
+
+        expected_version = _parse_if_match(request)
+        idem_key = _require_idem_key(request)
+        fingerprint = content_fingerprint(
+            {"resource_id": resource_id, "expected_version": expected_version}
+        )
+
+        def side_effect() -> tuple[int, dict[str, Any]]:
+            res = request.app.state.resources.delete(
+                ctx.tenant_id, resource_id, expected_version
+            )
+            out = res.as_dict()
+            # 首次删除时刻固定，保证同键重放逐字一致；合成墓碑无真实删除时刻
+            if out["created_at"] == 0.0:
+                out["updated_at"] = None
+            elif out.get("updated_at") is None:
+                out["updated_at"] = out["created_at"]
+            return 200, out
+
+        (status_code, result), replayed = request.app.state.idempotency.execute(
+            ctx.tenant_id, idem_key, fingerprint, side_effect, op=OP_DELETE
+        )
+
+        _log(
+            request.state.request_id,
+            "resource_deleted" if not replayed else "resource_delete_replayed",
+            f"tenant={ctx.tenant_id} cred={ctx.credential_fingerprint} key={idem_key}",
+        )
+        body = VersionRegistry.project_response(spec, result)
+        body["request_id"] = request.state.request_id
+        return JSONResponse(
+            status_code=status_code,
+            content=body,
+            headers={"x-request-id": request.state.request_id},
+        )
+
+    # 本机运维入口（凭证/限流/灰度/配置版本与回退），最后注册
+    register_admin_routes(app)
 
     return app
 

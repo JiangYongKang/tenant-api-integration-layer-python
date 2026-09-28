@@ -73,14 +73,15 @@ class VersionRegistry:
     @staticmethod
     def project_response(spec: VersionSpec, internal: dict[str, Any]) -> dict[str, Any]:
         """把内部表示投影为请求版本的对外表示（字段重命名 / 裁剪）。"""
+        always_visible = {"id", "status", "status_detail", "created_at"}
+        # 生命周期字段（乐观并发版本/墓碑）只在支持 resource_lifecycle 的版本出现
+        lifecycle_visible = {"version", "updated_at", "deleted"}
+        allowed = set(always_visible)
+        if "resource_lifecycle" in spec.capabilities:
+            allowed |= lifecycle_visible
         out: dict[str, Any] = {}
         for key, value in internal.items():
             out_key = spec.response_field_names.get(key, key)
-            if out_key in spec.known_fields or out_key in (
-                "id",
-                "status",
-                "status_detail",
-                "created_at",
-            ):
+            if out_key in spec.known_fields or out_key in allowed:
                 out[out_key] = value
         return out
