@@ -59,6 +59,27 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
   出现，v1 响应按版本投影裁剪；创建响应不含这些生命周期字段（取当前版本请用
   `GET`）。
 
+### 创建响应字段（v1 / v2 一致的老契约）
+
+`POST /api/resources` 成功（201）的响应体包含创建时提交与服务端生成的字段：
+
+- v1：`id`、`name`（**原样回显创建时提交的资源名**）、`status`、`created_at`；
+- v2：在 v1 基础上额外含 `labels`（未传时为 `{}`）；
+- 灰度 `extended-status` 打开且版本具备该能力时，v2 响应再附加 `status_detail`；
+- 两个版本的创建响应都**不含** `version` / `updated_at` / `deleted`。
+
+同一 `Idempotency-Key` 重放时（HTTP 200），响应业务字段（含 `name`、`labels`、
+`created_at`、`status_detail`）与首次**逐字一致**，且不会创建第二个资源；
+`request_id` 按请求生成，不在一致性比较范围内。
+
+### 删除后的状态与存活统计
+
+- 删除只置墓碑：`GET` 已删资源稳定 `NOT_FOUND(404)`，资源不再被视为存活。
+- **存活数量只统计未删除资源**：资源删除后不计入存活数（全部删除则归零），
+  重复删除（同键重放或换新键）不会改变存活数，墓碑不留任何计数/状态残留。
+- 删除从未存在过的资源同样返回稳定的 `200`（`deleted: true`），多次调用
+  （含换新幂等键）结果逐字一致，不影响任何统计。
+
 ## 本机运维入口（`/admin/*`）
 
 仅接受来自 loopback（`127.0.0.1` / `::1`）的请求；其他来源一律 `404`，
@@ -70,7 +91,7 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
 | --- | --- |
 | `POST /admin/credentials` | 签发租户凭证（body：`tenant_id`、`scopes`、可选 `secret`/`expires_at`） |
 | `POST /admin/credentials/{key_id}/rotate` | 轮换：换发新 key/secret 并原子吊销旧 key；旧 key 不存在 `404` |
-| `POST /admin/credentials/{key_id}/revoke` | 吊销；重复吊销幂等（`existed` 区分是否曾经存在） |
+| `POST /admin/credentials/{key_id}/revoke` | 吊销；重复吊销幂等（`existed` 区分该 key 吊销前是否存在）。吊销不存在的凭证不产生配置新版本 |
 | `PUT /admin/rate-limits/{tenant_id}` | 按 `(租户, endpoint)` 调整 `capacity` / `refill_per_second` |
 | `PUT /admin/flags/{name}` | 调整单个灰度开关（`rollout`、`overrides`） |
 | `PUT /admin/flags` | 整体替换全部灰度开关（原子） |
@@ -84,7 +105,8 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
 
 ## 配置版本、历史与回退
 
-- 每次生效的配置（包括回退）都得到一个**严格单调递增**的配置版本号。
+- 每次**实际生效**的配置变更（包括回退）都得到一个**严格单调递增**的配置版本号；
+  未产生实际变更的调用（吊销不存在的凭证、被拒绝的非法配置）不产生新版本。
 - 回退以目标版本的内容生成一个新的当前版本（版本号继续递增），**原子整体
   切换**，切换后对外行为与该目标版本当时一致（凭证、限流额度、灰度一并恢复）；
   回退同时清空限流令牌桶，避免桶状态残留导致行为与目标版本不符。
@@ -93,6 +115,13 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
   （配置内容非法）是不同的错误码。
 - 历史版本**有界保留**（默认 10，可用 `LayerConfig.config_history_limit`
   调整），超出丢弃最旧版本；当前生效版本绝不会被丢弃。
+- **空操作不产生版本**：吊销一个当前并不存在的凭证（已吊销过、或从未签发）时
+  没有任何实际配置变更，**配置版本号保持不变**，也不在有界历史中占用槽位——
+  反复空吊销不会把真正生效过的版本顶掉而导致日后无法回退。接口仍稳定返回
+  `200 {"revoked": true, "existed": false, "config_version": n}`：
+  `existed=false` 表明本次没有发生实际吊销，`config_version` 停在上一次真实
+  变更的版本。只有吊销一个当前存在的凭证才推进版本。同理，非法配置被拒绝时
+  版本也不前进。
 
 ## 脱敏约定
 
@@ -206,6 +235,13 @@ uv run pytest tests/ -v -s
   404、仅 loopback 可访问运维入口、运维日志不含完整密钥。
 - 配置管理单元（`tests/test_config_manager.py`）：变更全有或全无、20 并发提交无
   半状态、进行中快照不被后续提交/回退污染、回退内容独立副本、脱敏串格式。
+- 本轮修复回归（`tests/test_bugfix_regression.py`）：
+  - 创建响应保留 `name`（v1/v2），同幂等键重放响应（含 `name`/`labels`）逐字
+    一致且只创建一个资源；
+  - 吊销已吊销 / 从未签发的凭证：`existed=false`、HTTP 200，配置版本不前进，
+    反复空吊销不占用有界历史槽位、真实旧版本仍可回退；真实吊销照常推进版本；
+  - 删除后存活数量只统计未删除资源（归零），重复删除（同键/新键）结果一致，
+    已删资源 `GET` 稳定 404，删除从未存在的资源也稳定一致。
 
 每个用例通过 `testcase` logger 打印输入与判定依据（`-s` 可见）。
 
@@ -223,6 +259,23 @@ curl -s -X POST localhost:8000/admin/credentials \
 curl -s -X POST localhost:8000/api/resources -H 'x-api-version: v2' \
   -H 'x-api-key-id: <key_id>' -H 'x-api-secret: supersecret123' \
   -H 'idempotency-key: c1' -H 'content-type: application/json' -d '{"name":"a"}'
+# 响应含 id/name/status/created_at（v2 还含 labels）；用同一 idempotency-key
+# 重放，响应业务字段与第一次逐字一致，HTTP 状态码为 200。
+
+# 吊销幂等与配置版本：真实吊销推进一次；随后重复吊销 / 吊销不存在的 key，
+# config_version 不再变化，existed=false
+curl -s -X POST localhost:8000/admin/credentials/<key_id>/revoke
+curl -s -X POST localhost:8000/admin/credentials/<key_id>/revoke
+curl -s localhost:8000/admin/config/version
+
+# 删除后 GET 稳定 404，重复删除（换 Idempotency-Key）响应一致
+curl -s -X DELETE localhost:8000/api/resources/<rid> \
+  -H 'x-api-version: v2' -H 'x-api-key-id: <key_id>' \
+  -H 'x-api-secret: supersecret123' -H 'idempotency-key: d1'
+curl -s localhost:8000/api/resources/<rid> -H 'x-api-version: v2' \
+  -H 'x-api-key-id: <key_id>' -H 'x-api-secret: supersecret123'
+# 注：存活数量（ResourceStore.count）为进程内状态，无独立 HTTP 端点，
+# 通过 uv run pytest tests/test_bugfix_regression.py -v -s 验证归零语义。
 
 # 查询 / 调整 / 回退配置版本
 curl -s localhost:8000/admin/config/version
