@@ -22,6 +22,25 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
 | 请求标识 | `X-Request-Id`（可选，缺省自动生成），贯穿响应头、响应体与日志 |
 | 端点 | `POST /api/resources`（创建）、`GET /api/resources/{id}`（读）、`PATCH /api/resources/{id}`（更新，v2）、`DELETE /api/resources/{id}`（删除，v2）；另有仅本机可用的 `/admin/*` 运维入口 |
 
+## 创建响应字段
+
+`POST /api/resources` 成功（首次 `201`，同幂等键重放 `200`）的响应体在两个版本中
+都**回显资源名 `name`**（与迭代前的老行为保持一致，后续写法变更不会让该字段丢失）：
+
+| 字段 | v1 | v2 | 说明 |
+| --- | --- | --- | --- |
+| `id` | ✓ | ✓ | 服务端生成的资源 id |
+| `name` | ✓ | ✓ | 创建时提交的资源名（逐字回显） |
+| `status` | ✓ | ✓ | 资源状态（默认 `active`） |
+| `created_at` | ✓ | ✓ | 创建时间（epoch 秒） |
+| `labels` | — | ✓ | 仅 v2：创建时提交的标签 |
+| `status_detail` | — | 灰度开启时 | 仅 v2 且 `extended-status` 对该租户生效时出现 |
+| `version` / `updated_at` / `deleted` | — | — | 生命周期字段不在创建响应出现，需要时用 `GET` 获取 |
+
+使用**相同幂等键 + 相同请求体重放**时，重放响应与首次响应的全部业务字段（含
+`name`、`id`、`created_at`）逐字一致，只是 HTTP 状态码为 `200`；`request_id`
+按请求生成，不在一致性比较范围内。
+
 ## 资源生命周期（v2 新增 `resource_lifecycle` 能力）
 
 更新与删除只在声明 `X-Api-Version: v2` 时可用；旧版本（v1）调用一律
@@ -43,8 +62,11 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
 - 可选 `If-Match: <version>`：携带时同样做乐观并发校验，过期返回
   `CONCURRENT_CONFLICT(409)` 且不删除。
 - **删除幂等**：删除保留墓碑（tombstone）。重复删除（同一幂等键或新键）都得到
-  一致、可解释的 `200`（`deleted: true`），不会变成内部错误；已删资源的
-  `GET` 稳定返回 `NOT_FOUND(404)`，不会残留成一个活资源。
+  一致、可解释的 `200`（`deleted: true`，字段逐字一致），不会变成内部错误；
+  对从未存在过的资源 id 删除同样稳定返回 `200`（合成墓碑视图）。
+- **删除后无状态残留**：已删资源的 `GET` 稳定返回 `NOT_FOUND(404)`；墓碑只用于
+  内部收敛重复删除，**不会被当成存活资源**——存活计数（`ResourceStore.count`）
+  只统计未删除资源，资源删完后计数归零，也不影响后续新建与统计。
 
 ### 生命周期操作的幂等
 
@@ -70,7 +92,7 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
 | --- | --- |
 | `POST /admin/credentials` | 签发租户凭证（body：`tenant_id`、`scopes`、可选 `secret`/`expires_at`） |
 | `POST /admin/credentials/{key_id}/rotate` | 轮换：换发新 key/secret 并原子吊销旧 key；旧 key 不存在 `404` |
-| `POST /admin/credentials/{key_id}/revoke` | 吊销；重复吊销幂等（`existed` 区分是否曾经存在） |
+| `POST /admin/credentials/{key_id}/revoke` | 吊销；重复吊销幂等（`existed` 区分吊销前是否存在；无实际变更时不产生新配置版本，见下） |
 | `PUT /admin/rate-limits/{tenant_id}` | 按 `(租户, endpoint)` 调整 `capacity` / `refill_per_second` |
 | `PUT /admin/flags/{name}` | 调整单个灰度开关（`rollout`、`overrides`） |
 | `PUT /admin/flags` | 整体替换全部灰度开关（原子） |
@@ -85,6 +107,12 @@ uv run pytest tests/ -q        # 运行全部测试（用例日志打印输入�
 ## 配置版本、历史与回退
 
 - 每次生效的配置（包括回退）都得到一个**严格单调递增**的配置版本号。
+- **只有真实变更才产生新版本**：对当前并不存在的凭证（已吊销过、或从未签发过）
+  再次调用吊销时，配置没有发生任何实际变化，**配置版本号不前进，也不写入有界
+  历史**；因此即使反复调用空吊销，也不会把真正生效过的历史版本从有界历史中顶掉，
+  以后仍可回退到那些版本。接口响应本身保持稳定可解释：HTTP `200`、
+  `revoked: true`，并用 `existed` 表示这次调用吊销前凭证是否真实存在
+  （首次真实吊销 `existed=true`，之后的重复/空吊销 `existed=false`）。
 - 回退以目标版本的内容生成一个新的当前版本（版本号继续递增），**原子整体
   切换**，切换后对外行为与该目标版本当时一致（凭证、限流额度、灰度一并恢复）；
   回退同时清空限流令牌桶，避免桶状态残留导致行为与目标版本不符。
@@ -193,6 +221,14 @@ uv run pytest tests/ -v -s
   （16 线程同键收敛）、并发冲突提交、限流超限与租户隔离、开关快照一致性/
   原子替换/非法配置、版本兼容与拒绝路径、超限请求体、内部异常屏蔽、
   请求标识贯穿。
+- 新增本轮修复回归（`tests/test_bugfix_regression.py`）：
+  - 创建响应字段：v1/v2 创建成功均回显 `name`（v2 含 `labels`、不含生命周期字段），
+    同幂等键重放响应与首次逐字一致（含 `name`）；
+  - 吊销幂等与配置版本：吊销从未签发 / 已吊销的凭证时 `existed=false` 且
+    `current_version`、`history_versions` 完全不变；20 次空吊销不会把真实历史版本
+    顶出有界历史（仍可回退）；`ConfigManager` 单元层同样验证；
+  - 删除干净：资源删完存活计数归零（墓碑不计入），同键/新键重复删除响应逐字一致、
+    已删资源 `GET` 恒 404，删除从未存在的 id 稳定 200 且不影响计数与后续操作。
 - 新增生命周期（`tests/test_lifecycle.py`）：更新成功与版本递增、并发更新单胜者
   与过期版本提示、并发冲突与幂等/参数错误的错误码区分、更新幂等重放逐字一致、
   删除幂等（同键重放 / 已删再删）、过期 `If-Match` 删除冲突、并发删除收敛到同一
@@ -228,4 +264,22 @@ curl -s -X POST localhost:8000/api/resources -H 'x-api-version: v2' \
 curl -s localhost:8000/admin/config/version
 curl -s -X POST localhost:8000/admin/config/rollback \
   -H 'content-type: application/json' -d '{"version": 1}'
+
+# 本轮修复快速核对：
+# 1) 创建响应里应能看到 "name":"a"（v1/v2 都是）；同键再放一遍字段完全一致
+curl -s -X POST localhost:8000/api/resources -H 'x-api-version: v2' \
+  -H 'x-api-key-id: <key_id>' -H 'x-api-secret: supersecret123' \
+  -H 'idempotency-key: c1' -H 'content-type: application/json' -d '{"name":"a"}'
+# 2) 吊销一个不存在的 key 多次：每次 200、existed=false，config/version 输出不变
+for i in 1 2 3; do
+  curl -s -X POST localhost:8000/admin/credentials/never-issued/revoke
+  curl -s localhost:8000/admin/config/version
+done
+# 3) 删除后再删：两次均 200 且 deleted=true；再查返回 404
+curl -s -X DELETE localhost:8000/api/resources/<id> -H 'x-api-version: v2' \
+  -H 'x-api-key-id: <key_id>' -H 'x-api-secret: supersecret123' -H 'idempotency-key: d1'
+curl -s -X DELETE localhost:8000/api/resources/<id> -H 'x-api-version: v2' \
+  -H 'x-api-key-id: <key_id>' -H 'x-api-secret: supersecret123' -H 'idempotency-key: d2'
+curl -s localhost:8000/api/resources/<id> -H 'x-api-version: v2' \
+  -H 'x-api-key-id: <key_id>' -H 'x-api-secret: supersecret123'
 ```

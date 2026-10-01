@@ -207,10 +207,12 @@ def create_app(config: LayerConfig | None = None) -> FastAPI:
                 payload["name"],
                 labels=payload.get("labels"),
             )
-            # 创建响应只含创建语义字段；生命周期字段（version/updated_at/deleted）
-            # 属于后续版本的读取/更新/删除投影，不在创建响应出现
+            # 创建响应保持迭代前的老行为：回显资源名（v1/v2 均可见）。
+            # 生命周期字段（version/updated_at/deleted）属于后续版本的
+            # 读取/更新/删除投影，不在创建响应出现。
             out: dict[str, Any] = {
                 "id": res.id,
+                "name": res.name,
                 "status": res.status,
                 "created_at": res.created_at,
             }

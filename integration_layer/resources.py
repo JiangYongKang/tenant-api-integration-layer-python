@@ -142,5 +142,10 @@ class ResourceStore:
             return res
 
     def count(self, tenant_id: str) -> int:
+        """存活资源数：墓碑（已删除）与其他租户都不计入，删除后归零。"""
         with self._lock:
-            return sum(1 for (t, _) in self._items if t == tenant_id)
+            return sum(
+                1
+                for (t, _), res in self._items.items()
+                if t == tenant_id and not res.deleted
+            )

@@ -139,14 +139,24 @@ class ConfigManager:
         return self._commit(mutate)
 
     def revoke_credential(self, key_id: str) -> bool:
-        """吊销凭证，原子生效；重复吊销幂等。返回该 key 吊销前是否存在。"""
+        """吊销凭证，原子生效；重复吊销幂等。返回该 key 吊销前是否存在。
+
+        无实际变更（已吊销过 / 从未签发）时**不产生新配置版本**：
+        当前版本与有界历史保持原样，空操作不会顶掉真正生效过的历史版本。
+        """
         if not key_id:
             raise ApiError(ErrorCode.VALIDATION_FAILED, "key_id is required")
 
-        def mutate(snap: ConfigSnapshot) -> bool:
-            return snap.credentials.pop(key_id, None) is not None
+        with self._lock:
+            # 检查与提交在同一把锁内完成：不存在即无变更，直接短路
+            if key_id not in self._history[self._current_version].credentials:
+                return False
 
-        return self._commit(mutate)
+            def mutate(snap: ConfigSnapshot) -> None:
+                snap.credentials.pop(key_id, None)
+
+            self._commit_locked(mutate)
+            return True
 
     # ---- 限流 ----
 

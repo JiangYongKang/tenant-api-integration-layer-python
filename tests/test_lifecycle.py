@@ -8,19 +8,6 @@ from integration_layer.errors import ErrorCode
 from .conftest import log_case
 
 
-@pytest.fixture()
-def v2_tenant(app):
-    key_id, secret = app.state.credentials.register(
-        "tenant-life", {"resources:read", "resources:write"}
-    )
-    headers = {
-        "x-api-key-id": key_id,
-        "x-api-secret": secret,
-        "x-api-version": "v2",
-    }
-    return headers
-
-
 def _create(client, headers, name="r", key="c-1"):
     r = client.post("/api/resources", json={"name": name}, headers={**headers, "idempotency-key": key})
     assert r.status_code == 201, r.text

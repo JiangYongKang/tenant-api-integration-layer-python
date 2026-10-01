@@ -40,5 +40,18 @@ def tenant(app):
     }
 
 
+@pytest.fixture()
+def v2_tenant(app):
+    """注册 v2（具备资源生命周期能力）的读写租户，返回请求头。"""
+    key_id, secret = app.state.credentials.register(
+        "tenant-life", {"resources:read", "resources:write"}
+    )
+    return {
+        "x-api-key-id": key_id,
+        "x-api-secret": secret,
+        "x-api-version": "v2",
+    }
+
+
 def log_case(title: str, inputs: dict, basis: str) -> None:
     case_log.info("CASE %s | inputs=%s | basis=%s", title, inputs, basis)
